@@ -17,7 +17,7 @@ class Team(models.Model):
     name = models.CharField(max_length=100)
     code = models.CharField(max_length=10, blank=True, default='')
     flag_url = models.URLField(blank=True, default='')
-    country_code = models.CharField(max_length=2, blank=True, default='')
+    country_code = models.CharField(max_length=10, blank=True, default='')
     group_name = models.CharField(max_length=10, blank=True, null=True)
     points = models.IntegerField(default=0)
     played = models.IntegerField(default=0)
