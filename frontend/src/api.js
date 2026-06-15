@@ -17,3 +17,8 @@ export async function fetchStandings() {
   if (!res.ok) throw new Error('Failed to fetch standings')
   return res.json()
 }
+
+export async function triggerSync() {
+  const res = await fetch(`${BASE}/sync/`)
+  return res.json()
+}
