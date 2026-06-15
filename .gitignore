@@ -31,10 +31,6 @@ node_modules/
 .pnp
 .pnp.js
 
-# Production build outputs (Vite or Create React App)
-dist/
-build/
-
 # Testing caches
 .eslintcache
 
