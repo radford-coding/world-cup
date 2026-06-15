@@ -378,6 +378,34 @@ body {
   color: var(--text-muted);
 }
 
+.team-tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.team-tabs .tab-btn {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 18px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.team-tabs .tab-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.team-tabs .tab-btn.active {
+  background: var(--primary-light);
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
 /* ─── Teams - Groups ─── */
 
 .groups-grid {
@@ -670,6 +698,16 @@ body {
   font-size: 0.72rem;
   color: var(--text-muted);
   margin-left: 24px;
+}
+
+.col-team-wide {
+  text-align: left;
+  min-width: 140px;
+}
+
+.standings-table .col-team-wide .standing-team-name {
+  font-weight: 600;
+  font-size: 0.85rem;
 }
 
 /* ─── Responsive ─── */

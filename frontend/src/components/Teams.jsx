@@ -1,37 +1,91 @@
 import { useState, useEffect } from 'react'
-import { fetchTeams } from '../api'
+import { fetchTeams, fetchGroups, fetchGames } from '../api'
 import TeamWithPerson from './TeamWithPerson'
 
+const TYPE_LABELS = {
+  group: 'Group Stage',
+  r32: 'Round of 32',
+  r16: 'Round of 16',
+  qf: 'Quarter-finals',
+  sf: 'Semi-finals',
+  third: 'Third Place',
+  final: 'Final',
+}
+
+const ROUND_ORDER = ['r32', 'r16', 'qf', 'sf', 'third', 'final']
+
 export default function Teams() {
-  const [data, setData] = useState(null)
+  const [teamsMap, setTeamsMap] = useState({})
+  const [groups, setGroups] = useState(null)
+  const [knockoutGames, setKnockoutGames] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [tab, setTab] = useState('groups')
+
+  const stage = groups ? 'group' : null
 
   useEffect(() => {
     setLoading(true)
     setError(null)
-    fetchTeams()
-      .then(setData)
+    Promise.all([fetchTeams(), fetchGroups(), fetchGames()])
+      .then(([teamsData, groupsData, gamesData]) => {
+        const tmap = {}
+        teamsData.teams.forEach((t) => {
+          tmap[t.id] = {
+            id: t.id,
+            name: t.name_en,
+            flag_url: t.flag,
+            country_code: t.iso2,
+          }
+        })
+        setTeamsMap(tmap)
+
+        const grouped = {}
+        groupsData.groups.forEach((g) => {
+          grouped[g.name] = g.teams.map((entry, idx) => {
+            const teamInfo = tmap[entry.team_id] || { name: `Team #${entry.team_id}` }
+            return {
+              id: entry.team_id,
+              name: teamInfo.name,
+              flag_url: teamInfo.flag_url,
+              country_code: teamInfo.country_code,
+              group_position: idx + 1,
+              played: parseInt(entry.mp),
+              wins: parseInt(entry.w),
+              draws: parseInt(entry.d),
+              losses: parseInt(entry.l),
+              goals_for: parseInt(entry.gf),
+              goals_against: parseInt(entry.ga),
+              goal_diff: parseInt(entry.gd),
+              points: parseInt(entry.pts),
+            }
+          })
+        })
+        setGroups(grouped)
+
+        const knockouts = gamesData.games.filter((g) => g.type !== 'group')
+        setKnockoutGames(knockouts)
+      })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
   }, [])
 
   if (loading) return <div className="page"><div className="loading">Loading teams...</div></div>
   if (error) return <div className="page"><div className="error">{error}</div></div>
-  if (!data) return null
+  if (!groups) return null
 
   return (
     <div className="page teams-page">
       <div className="page-header">
         <h1>Teams</h1>
-        <span className="stage-badge">{data.stage === 'group' ? 'Group Stage' : 'Knockout Stage'}</span>
+        <div className="team-tabs">
+          <button className={`tab-btn${tab === 'groups' ? ' active' : ''}`} onClick={() => setTab('groups')}>Groups</button>
+          <button className={`tab-btn${tab === 'knockout' ? ' active' : ''}`} onClick={() => setTab('knockout')}>Knockout</button>
+        </div>
       </div>
 
-      {data.stage === 'group' ? (
-        <GroupView groups={data.groups} />
-      ) : (
-        <KnockoutView rounds={data.rounds} />
-      )}
+      {tab === 'groups' && <GroupView groups={groups} />}
+      {tab === 'knockout' && <KnockoutView games={knockoutGames} teamsMap={teamsMap} />}
     </div>
   )
 }
@@ -82,37 +136,60 @@ function GroupView({ groups }) {
   )
 }
 
-function KnockoutView({ rounds }) {
-  const roundOrder = ['Round of 16', 'Quarter-finals', 'Semi-finals', 'Final']
-  const orderedRounds = roundOrder.filter((r) => rounds[r])
+function KnockoutView({ games, teamsMap }) {
+  const rounds = {}
+  games.forEach((g) => {
+    if (!rounds[g.type]) rounds[g.type] = []
+    rounds[g.type].push(g)
+  })
+
+  const orderedRounds = ROUND_ORDER.filter((r) => rounds[r])
+
+  if (orderedRounds.length === 0) {
+    return <div className="empty">No knockout games available yet.</div>
+  }
 
   return (
     <div className="knockout-view">
-      {orderedRounds.map((roundName) => {
-        const games = rounds[roundName]
-        const allSettled = games.every((g) => g.status === 'finished')
+      {orderedRounds.map((roundType) => {
+        const roundGames = rounds[roundType]
+        const roundName = TYPE_LABELS[roundType] || roundType
+        const allSettled = roundGames.every((g) => g.time_elapsed === 'finished')
+
         return (
-          <div key={roundName} className="knockout-round">
+          <div key={roundType} className="knockout-round">
             <h2 className="round-title">
               {roundName}
               {allSettled && <span className="round-complete">Complete</span>}
             </h2>
             <div className="round-games">
-              {games.map((g) => {
-                const homeWin = g.status === 'finished' && g.home_score > g.away_score
-                const awayWin = g.status === 'finished' && g.away_score > g.home_score
-                const draw = g.status === 'finished' && g.home_score === g.away_score
+              {roundGames.map((g) => {
+                const homeTeam = teamsMap[g.home_team_id] || {
+                  name: g.home_team_label || g.home_team_name_en || 'TBD',
+                }
+                const awayTeam = teamsMap[g.away_team_id] || {
+                  name: g.away_team_label || g.away_team_name_en || 'TBD',
+                }
+                const homeScore = parseInt(g.home_score)
+                const awayScore = parseInt(g.away_score)
+                const finished = g.time_elapsed === 'finished'
+                const homeWin = finished && homeScore > awayScore
+                const awayWin = finished && awayScore > homeScore
+
                 return (
-                  <div key={g.id} className={`knockout-game ${g.status === 'finished' ? 'settled' : ''}`}>
+                  <div key={g.id} className={`knockout-game ${finished ? 'settled' : ''}`}>
                     <div className={`ko-team ${homeWin ? 'winner' : ''}`}>
-                      <TeamWithPerson team={g.home_team} showScore score={g.home_score} />
+                      <TeamWithPerson team={homeTeam} showScore score={homeScore} />
                     </div>
                     <div className={`ko-team ${awayWin ? 'winner' : ''}`}>
-                      <TeamWithPerson team={g.away_team} showScore score={g.away_score} />
+                      <TeamWithPerson team={awayTeam} showScore score={awayScore} />
                     </div>
-                    {g.status === 'scheduled' && (
+                    {g.time_elapsed !== 'finished' && (
                       <div className="ko-time">
-                        {new Date(g.date).toLocaleDateString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                        {new Date(g.local_date).toLocaleDateString('en', {
+                          month: 'short', day: 'numeric',
+                          hour: '2-digit', minute: '2-digit',
+                        })}
                       </div>
                     )}
                   </div>
