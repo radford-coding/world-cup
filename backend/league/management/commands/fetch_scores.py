@@ -1,211 +1,189 @@
-import os
-from datetime import datetime, timezone
+from datetime import datetime
 
 import requests
-from django.conf import settings
 from django.core.management.base import BaseCommand
-from django.utils import timezone as tz
+from django.utils import timezone
 
 from league.models import Team, Game
 
 
+API_BASE = 'https://worldcup26.ir'
+
+
 class Command(BaseCommand):
-    help = 'Fetch fixtures and standings from API-Football'
+    help = 'Fetch scores and standings from worldcup26.ir (free 2026 WC API)'
 
     def handle(self, *args, **options):
-        api_key = settings.API_FOOTBALL_KEY
-        if not api_key:
-            self.stdout.write(self.style.ERROR('API_FOOTBALL_KEY not set'))
+        self.stdout.write('Fetching from worldcup26.ir...')
+        teams_map = self._build_teams_map()
+        if teams_map is None:
             return
-
-        league_id = settings.API_FOOTBALL_LEAGUE_ID
-        season = settings.API_FOOTBALL_SEASON
-        headers = {'x-apisports-key': api_key}
-        base = 'https://v3.football.api-sports.io'
-
-        self._fetch_fixtures(base, headers, league_id, season)
-        self._fetch_standings(base, headers, league_id, season)
+        self._fetch_games(teams_map)
+        self._fetch_standings(teams_map)
         self.stdout.write(self.style.SUCCESS('Sync complete'))
 
-    def _api_get(self, url, headers, params):
+    def _api_get(self, path):
         try:
-            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            resp = requests.get(
+                f'{API_BASE}{path}',
+                timeout=15,
+                headers={'User-Agent': 'WorldCupLeague/1.0'},
+            )
             resp.raise_for_status()
             data = resp.json()
-            if data.get('errors') and data['errors']:
-                self.stdout.write(self.style.WARNING(f"API errors: {data['errors']}"))
+            if isinstance(data, dict) and 'msg' in data and 'error' in str(data.get('msg', '')).lower():
+                self.stdout.write(self.style.WARNING(f'API error: {data["msg"]}'))
                 return None
-            return data.get('response', [])
+            return data
         except requests.RequestException as e:
-            self.stdout.write(self.style.ERROR(f"Request failed: {e}"))
+            self.stdout.write(self.style.ERROR(f'Request failed: {e}'))
             return None
 
-    def _get_or_create_team(self, team_data):
-        api_id = team_data['id']
-        team, created = Team.objects.get_or_create(
-            api_id=api_id,
-            defaults={
-                'name': team_data['name'],
-                'code': team_data.get('code', ''),
-                'flag_url': team_data.get('logo', ''),
-                'country_code': '',
-            },
-        )
-        if not created:
-            changed = False
-            if team.name != team_data['name']:
-                team.name = team_data['name']
-                changed = True
-            code = team_data.get('code', '')
-            if code and team.code != code:
-                team.code = code
-                changed = True
-            logo = team_data.get('logo', '')
-            if logo and team.flag_url != logo:
-                team.flag_url = logo
-                changed = True
-            if changed:
-                team.save()
-        return team
+    def _build_teams_map(self):
+        data = self._api_get('/get/teams')
+        if not data:
+            return {}
+        teams_list = data if isinstance(data, list) else data.get('teams', data) or []
+        result = {}
+        for t in teams_list:
+            name = t.get('name_en', '')
+            tid = str(t.get('id', ''))
+            result[name] = {'api_id': tid, 'group': t.get('groups', '')}
+            result[tid] = name
+        self.stdout.write(f'  Loaded {len([k for k in result if k.isalpha()])} team names')
+        return result
 
-    def _fetch_fixtures(self, base, headers, league_id, season):
-        self.stdout.write('Fetching fixtures...')
-        fixtures = self._api_get(
-            f'{base}/fixtures',
-            headers,
-            {'league': league_id, 'season': season},
-        )
-        if fixtures is None:
+    def _team_by_name(self, name, teams_map):
+        if not name or name not in teams_map:
+            return None
+        try:
+            return Team.objects.get(name=name)
+        except Team.DoesNotExist:
+            return None
+
+    def _parse_datetime(self, date_str):
+        try:
+            dt = datetime.strptime(date_str, '%m/%d/%Y %H:%M')
+            return timezone.make_aware(dt)
+        except (ValueError, TypeError):
+            return None
+
+    def _fetch_games(self, teams_map):
+        self.stdout.write('Fetching games...')
+        data = self._api_get('/get/games')
+        if not data:
             return
 
-        for f in fixtures:
-            fixture = f['fixture']
-            teams = f['teams']
-            goals = f['goals']
-            status = fixture['status']['short']
+        games = data if isinstance(data, list) else data.get('games', data) or []
+        updated = 0
+        skipped = 0
 
-            home_team = self._get_or_create_team(teams['home'])
-            away_team = self._get_or_create_team(teams['away'])
+        for g in games:
+            home_name = g.get('home_team_name_en', '')
+            away_name = g.get('away_team_name_en', '')
+            home_team = self._team_by_name(home_name, teams_map)
+            away_team = self._team_by_name(away_name, teams_map)
+            if not home_team or not away_team:
+                skipped += 1
+                continue
 
-            date_str = fixture['date']
+            finished = (g.get('finished') or '').upper() == 'TRUE'
+            time_elapsed = (g.get('time_elapsed') or '').lower()
+            if finished:
+                status = 'finished'
+            elif time_elapsed in ('live', '1h', '2h', 'ht', 'et', 'int'):
+                status = 'live'
+            else:
+                status = 'scheduled'
+
+            home_score = g.get('home_score')
+            away_score = g.get('away_score')
             try:
-                date_dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-            except ValueError:
-                date_dt = tz.now()
+                home_score = int(home_score) if home_score not in (None, '', 'null') else None
+                away_score = int(away_score) if away_score not in (None, '', 'null') else None
+            except (ValueError, TypeError):
+                home_score = None
+                away_score = None
 
-            mapped_status = 'scheduled'
-            if status in ('FT', 'AET', 'PEN'):
-                mapped_status = 'finished'
-            elif status == 'LIVE':
-                mapped_status = 'live'
-            elif status in ('HT', 'ET', 'BT', 'INT'):
-                mapped_status = 'live'
-            elif status in ('NS', 'TBD'):
-                mapped_status = 'scheduled'
+            date_dt = self._parse_datetime(g.get('local_date'))
+            if not date_dt:
+                date_dt = timezone.now()
 
-            stage_raw = fixture.get('stage', '')
-            round_raw = fixture.get('round', '')
+            stage = g.get('type', '')
+            group = g.get('group', '')
+            round_raw = f"Group {group}" if stage == 'group' else stage
+
+            try:
+                api_id = int(g['id'])
+            except (ValueError, TypeError):
+                skipped += 1
+                continue
 
             Game.objects.update_or_create(
-                api_fixture_id=fixture['id'],
+                api_fixture_id=api_id,
                 defaults={
                     'home_team': home_team,
                     'away_team': away_team,
-                    'home_score': goals.get('home'),
-                    'away_score': goals.get('away'),
-                    'status': mapped_status,
+                    'home_score': home_score,
+                    'away_score': away_score,
+                    'status': status,
                     'date': date_dt,
-                    'stage': stage_raw,
+                    'stage': stage,
                     'round': round_raw,
-                    'venue': fixture.get('venue', {}).get('name', ''),
+                    'venue': '',
                 },
             )
+            updated += 1
 
-        self.stdout.write(f"  Synced {len(fixtures)} fixtures")
+        self.stdout.write(f'  {updated} games synced ({skipped} skipped)')
 
-    def _fetch_standings(self, base, headers, league_id, season):
+    def _fetch_standings(self, teams_map):
         self.stdout.write('Fetching standings...')
-        standings_data = self._api_get(
-            f'{base}/standings',
-            headers,
-            {'league': league_id, 'season': season},
-        )
-        if standings_data is None:
+        data = self._api_get('/get/groups')
+        if not data:
             return
 
-        knockout_seen = False
+        groups_data = data if isinstance(data, list) else data.get('groups', data) or []
+        updated = 0
 
-        for league_entry in standings_data:
-            standings_list = league_entry.get('standings', [])
-            for group_standings in standings_list:
-                for entry in group_standings:
-                    team_data = entry['team']
-                    api_id = team_data['id']
+        for group in groups_data:
+            group_name = group.get('name', '')
+            for entry in group.get('teams', []):
+                team_id = str(entry.get('team_id', ''))
+                team_name = teams_map.get(team_id, '')
+                if not team_name:
+                    continue
 
-                    team = self._get_or_create_team(team_data)
+                team = self._team_by_name(team_name, teams_map)
+                if not team:
+                    self.stdout.write(self.style.WARNING(f'  Team not found: "{team_name}"'))
+                    continue
 
-                    group_name = (entry.get('group') or '').replace('Group ', '')
-                    description = entry.get('description', '')
-                    if description and 'knockout' in description.lower():
-                        knockout_seen = True
+                try:
+                    mp = int(entry.get('mp', 0))
+                    w = int(entry.get('w', 0))
+                    d = int(entry.get('d', 0))
+                    l = int(entry.get('l', 0))
+                    pts = int(entry.get('pts', 0))
+                    gf = int(entry.get('gf', 0))
+                    ga = int(entry.get('ga', 0))
+                    gd = int(entry.get('gd', 0))
+                    pos = int(entry.get('position', entry.get('pos', 0)))
+                except (ValueError, TypeError):
+                    continue
 
-                    team.group_name = group_name if not knockout_seen else None
-                    team.points = int(entry.get('points', 0))
-                    team.played = int(entry.get('played', 0))
-                    team.wins = int(entry.get('win', 0))
-                    team.draws = int(entry.get('draw', 0))
-                    team.losses = int(entry.get('lose', 0))
-                    team.goals_for = int(entry.get('goals', {}).get('for', 0))
-                    team.goals_against = int(entry.get('goals', {}).get('against', 0))
-                    team.goal_diff = int(entry.get('goalsDiff', 0))
-                    team.group_position = int(entry.get('rank', 0))
-                    team.tournament_stage = 'knockout' if knockout_seen else 'group'
-                    team.save()
+                team.group_name = group_name
+                team.points = pts
+                team.played = mp
+                team.wins = w
+                team.draws = d
+                team.losses = l
+                team.goals_for = gf
+                team.goals_against = ga
+                team.goal_diff = gd
+                team.group_position = pos
+                team.tournament_stage = 'group'
+                team.save()
+                updated += 1
 
-        self.stdout.write(f'  Standings updated')
-
-        if not knockout_seen:
-            self._update_knockout_teams(base, headers, league_id, season)
-
-    def _update_knockout_teams(self, base, headers, league_id, season):
-        fixtures = self._api_get(
-            f'{base}/fixtures',
-            headers,
-            {'league': league_id, 'season': season, 'status': 'FT'},
-        )
-        if fixtures is None:
-            return
-
-        advanced = set()
-        for f in fixtures:
-            fixture = f['fixture']
-            round_raw = fixture.get('round', '')
-            if round_raw in ('Group Stage', 'Group A', 'Group B', 'Group C', 'Group D',
-                             'Group E', 'Group F', 'Group G', 'Group H'):
-                continue
-            goals = f['goals']
-            if goals.get('home') is not None and goals.get('away') is not None:
-                if goals['home'] > goals['away']:
-                    advanced.add(f['teams']['home']['id'])
-                elif goals['away'] > goals['home']:
-                    advanced.add(f['teams']['away']['id'])
-                elif fixture['status']['short'] == 'PEN':
-                    penalty = fixture.get('score', {}).get('penalty', {})
-                    if penalty.get('home') is not None:
-                        if penalty['home'] > penalty['away']:
-                            advanced.add(f['teams']['home']['id'])
-                        else:
-                            advanced.add(f['teams']['away']['id'])
-
-        Team.objects.filter(
-            tournament_stage='group',
-            group_position__isnull=False,
-        ).update(tournament_stage='knockout')
-
-        teams_in_knockout = Team.objects.filter(api_id__in=list(advanced))
-        for team in teams_in_knockout:
-            team.group_name = None
-            team.tournament_stage = 'knockout'
-            team.save()
-
-        self.stdout.write(f'  Updated knockout teams: {len(advanced)} teams advanced')
+        self.stdout.write(f'  {updated} team standings updated')
